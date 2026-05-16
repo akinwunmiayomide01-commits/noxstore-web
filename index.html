@@ -307,17 +307,6 @@
   }
   @keyframes pop { from{transform:scale(0.2);opacity:0} to{transform:scale(1);opacity:1} }
 
-  /* ── PAYFRAME ── */
-  #payframe {
-    position: fixed; inset: 0; z-index: 100;
-    display: none; flex-direction: column; background: #fff;
-  }
-  #payframe.open { display: flex; }
-  #payframe-hdr {
-    background: #0b0e18; padding: 14px 20px;
-    display: flex; align-items: center; gap: 12px;
-  }
-
   /* ── MODAL ── */
   #logout-modal {
     display: none; position: fixed; inset: 0; z-index: 200;
@@ -568,15 +557,6 @@
 
 </div><!-- /app -->
 
-<!-- ══ PAYFRAME ══ -->
-<div id="payframe">
-  <div id="payframe-hdr">
-    <button class="back-btn" style="color:#aaa;" onclick="closePayframe()">←</button>
-    <span style="font-size:14px;color:#fff;font-weight:600;">Paystack Checkout</span>
-  </div>
-  <iframe id="payframe-iframe" title="Paystack Payment"></iframe>
-</div>
-
 <!-- ══ LOGOUT ══ -->
 <div id="logout-modal">
   <div class="modal-box">
@@ -638,7 +618,7 @@ const GAMES = [
   },
   {
     name: 'Clash of Clans', genre: 'Strategy',
-    logoUrl: 'clashofclanslogo.png',
+    logoUrl: 'clashofclanslogo.png',  // using local image since CoC's logo has a complex shape that doesn't render well as an icon
     fallback: '🏰', currency: 'Gems',
     idLabel: 'Player Tag', idHint: 'e.g. #2ABC123XY',
     idNote: 'Open Clash of Clans → Tap your profile → Copy the # Player Tag at the top.',
@@ -646,7 +626,7 @@ const GAMES = [
   },
 ];
 
-const AMOUNTS = [500, 1000, 2500, 1500, 5000, 10000];
+const AMOUNTS = [500, 1000, 1500, 2500, 5000, 10000];
 
 // ════════════════════════════════════════════════════════════════
 //  STATE — single source of truth
@@ -663,53 +643,49 @@ const state = {
 
 // ════════════════════════════════════════════════════════════════
 //  PAYSTACK REDIRECT HANDLER
-//  Catches Paystack's callback_url redirect with ?reference= params
+//  Catches Paystack's callback_url redirect with ?reference= / ?trxref=
+//  Works for full-page redirect mode (no iframe)
 // ════════════════════════════════════════════════════════════════
 (function handlePaystackRedirect() {
-  var params = new URLSearchParams(window.location.search);
-  var ref    = params.get('reference') || params.get('trxref');
+  var params    = new URLSearchParams(window.location.search);
+  var ref       = params.get('reference') || params.get('trxref');
   var isSuccess = params.get('payment') === 'success' || !!ref;
 
   if (!isSuccess) return;
 
-  // Store reference in state so success screen can use it
+  // Stash reference in state
   if (ref) state.reference = ref;
 
-  // Wait for DOM to be ready, then show success
+  // Clean the URL immediately so a refresh doesn't re-trigger
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  // Wait for DOM + splash to settle before switching to success screen
   setTimeout(function() {
-    // Populate whatever we have from URL params
-    $('success-ref').textContent    = ref || 'Payment Successful';
-    $('success-game').textContent   = state.currentGame ? state.currentGame.name : '—';
-    $('success-gameid').textContent = state.gameId || '—';
-    $('success-amount').textContent = state.selectedAmount ? fmt(state.selectedAmount) : '—';
+
+    // Populate success screen with available data
+    $('success-ref').textContent    = ref || 'N/A';
+    $('success-game').textContent   = '—';   // won't be in state after a full-page redirect
+    $('success-gameid').textContent = '—';
+    $('success-amount').textContent = '—';
     show('success');
 
-    // Clean the URL so refreshing doesn't re-trigger this
-    var cleanUrl = window.location.pathname;
-    window.history.replaceState({}, document.title, cleanUrl);
-
-    // If we have a reference, attempt backend verification
+    // Attempt backend verification if user is logged in
     if (ref && state.token) {
       api('/api/payments/verify', { reference: ref }, state.token)
         .then(function() {
-          var statusEls = document.querySelectorAll('#success .val');
-          statusEls.forEach(function(el) {
-            if (el.textContent === '—' || el.textContent === 'Confirmed ✓' || el.textContent === 'Payment received ✓') {
-              el.textContent = 'Confirmed ✓';
-            }
-          });
+          showToast('Payment verified!', 'success');
         })
-        .catch(function() { /* verification failed, success screen still shows */ });
+        .catch(function() { /* verification failed — Paystack webhook handles fulfillment */ });
     }
 
-    // Auto-redirect home after 6s
+    // Auto-redirect to Home after 6 seconds
     setTimeout(function() {
       if ($('success') && $('success').classList.contains('active')) {
         topUpAnother();
       }
     }, 6000);
 
-  }, 1000);
+  }, 1600);  // slightly longer than splash (1500ms) so splash finishes first
 })();
 
 
@@ -992,48 +968,14 @@ async function initializePayment() {
     if (!url) throw new Error('No payment URL received. Please try again.');
 
     state.reference = ref;
-    openPayframe(url);
+
+    // Step 3 — full-page redirect to Paystack (no iframe)
+    window.location.href = url;
+
   } catch(e) {
     show('topup');
     showToast(e.message, 'error');
   }
-}
-
-// Step 3 — open iframe, listen for Paystack messages
-function openPayframe(url) {
-  window.removeEventListener('message', _onPaystackMessage);
-  $('payframe-iframe').src = url;
-  $('payframe').classList.add('open');
-  window.addEventListener('message', _onPaystackMessage);
-}
-
-function _onPaystackMessage(e) {
-  if (!e.data) return;
-  var evt    = e.data.event  || '';
-  var status = e.data.status || '';
-
-  if (evt === 'successful' || status === 'success' || evt === 'completed') {
-    closePayframe();
-    verifyAndShowSuccess();
-    return;
-  }
-  if (evt === 'failed' || status === 'failed' || evt === 'cancelled' || status === 'cancelled') {
-    closePayframe();
-    show('topup');
-    var isCancelled = (evt === 'cancelled' || status === 'cancelled');
-    showToast(
-      isCancelled
-        ? 'Payment cancelled. You can try again.'
-        : 'Payment failed. Please try a different card or try again.',
-      'error'
-    );
-  }
-}
-
-function closePayframe() {
-  $('payframe').classList.remove('open');
-  setTimeout(function() { $('payframe-iframe').src = ''; }, 300);
-  window.removeEventListener('message', _onPaystackMessage);
 }
 
 // Step 4 — verify with backend before showing success
